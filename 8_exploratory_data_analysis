@@ -1,0 +1,322 @@
+library(DESeq2)
+library(ggplot2)
+library(biomaRt)
+library(gridExtra)
+library(grid)
+library(org.Mm.eg.db)
+library("clusterProfiler")
+library(enrichplot)
+library(reshape2)
+
+
+setwd("/Users/lysander/Desktop/rna_seq/feature_counts")
+
+# Data preprocessing 
+gene_table <- read.table(file = 'gene_counts.txt', header = TRUE, sep = '\t')
+
+colnames(gene_table) <- gsub("_aligned_sample_sorted.bam", 
+                             "", colnames(gene_table)) # Drop Unnecessary text on names
+rownames(gene_table) <- gene_table$Geneid # Make gene IDs row names
+
+gene_matrix <- as.matrix(gene_table[,c( 
+    c("SRR7821918", "SRR7821919",
+      "SRR7821920", "SRR7821921",
+      "SRR7821922", "SRR7821937",
+      "SRR7821938", "SRR7821939",
+      "SRR7821949", "SRR7821950",
+      "SRR7821951", "SRR7821952",
+      "SRR7821953", "SRR7821968",
+      "SRR7821969", "SRR7821970"))])
+
+
+metadata <- read.csv("metadata.csv", header = TRUE) # open to condition + tissue type DF
+metadata <- metadata[order(metadata$Sample),] # order metadata for DESeq2
+
+# Make DESeq2 object
+raw_data <- DESeqDataSetFromMatrix (countData <- gene_matrix,
+                        coldata <- metadata, # four levels 
+                        design = ~ Group) # deseign = ~ condition  # 2 facterial design # start with 
+
+
+# Get results from DESeq
+dds <- DESeq(raw_data)
+
+# normalize counts with a variance stabilizing transform procedure 
+vsd <- vst(dds, blind = TRUE) # Blind is T -> doesnt take into account read groups
+
+
+lePCA <- plotPCA(vsd, intgroup = "Group") + theme_minimal() + 
+    theme(plot.title = element_text(hjust = 0.2, vjust = 6)) +
+    labs( #title = "PCA of Case vs. Control in Lung and Blood Tissues", 
+          color = "Group Status") +
+    scale_color_manual(
+        values = c("Blood_WT_Case" = "salmon", "Blood_WT_Control" = "skyblue", 
+                   "Lung_WT_Case" = "palegreen", "Lung_WT_Control" = "orchid"),
+        labels = c("Blood_WT_Case" = "Infected Blood Samples", 
+                   "Blood_WT_Control" = "Uninfected Blood Samples",
+                   "Lung_WT_Case" = "Infected Lung Samples", 
+                   "Lung_WT_Control" = "Uninfected Lung Samples")) +
+    theme(plot.title = element_text(size = 16), 
+          axis.title = element_text(size = 14),  
+          axis.text = element_text(size = 12), 
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 12),
+          legend.position = "bottom") + 
+    guides(color = guide_legend(ncol = 2, nrow = 2))
+    # here we see clear distinct groups with little variation within groups
+    # meaning a) the quality is good as they are similar, and b) there are 
+    # differences between groups which may indicate biological significance
+
+lePCA
+ggsave(filename = "PCA.png", plot = lePCA, width = 11, height = 4, dpi = 300)
+
+# observe number of differentially expressed genes 
+
+# multipurpose function that prints the amount of significant genes (padj < 0.05 and +/-2log2 fold change)
+#   and creates a dataframe object from the table
+find_diff_expressed <- function(table) {
+    gene_dataframe <- data.frame(table)
+    gene_dataframe <- na.omit(gene_dataframe)
+
+    
+    # information about gene dataframe
+    total_length <- length(gene_dataframe$padj) # total number of genes being considered
+    # Number of genes that have significant difference in means when accounting for variation within means 
+    significant_p_value_dataframe <- gene_dataframe[gene_dataframe$padj < 0.05,]
+    significant_p_values <- length(significant_p_value_dataframe$padj)
+    
+    # Number of genes that have significant difference in means when accounting 
+    #   for variation within means AND are significantly upregulated or downregulated
+    significant_gene_dataframe <- significant_p_value_dataframe[significant_p_value_dataframe$log2FoldChange > 2 | 
+                                                                    significant_p_value_dataframe$log2FoldChange < -2,]
+    significant_p_and_log_values <- length(significant_gene_dataframe$padj)
+    
+    # Percent significant genes
+    percent_significant_genes <- length(significant_gene_dataframe$padj) / length(gene_dataframe$padj) * 100
+    
+    print (paste("Total Length = ", total_length))
+    print (paste ("Significant P values = ", significant_p_values))
+    print(paste ("Significant P values and less than -2 and greater than +2 logfold change = ", 
+                 significant_p_and_log_values))
+    print (paste ("Percent significant genes", percent_significant_genes))
+    
+   return (gene_dataframe) # used in downstream analysis 
+    
+}
+
+# when looking at all genes 35% of genes are differentially expressed
+gene_table <- results(dds)
+all_genes_df <- find_diff_expressed(gene_table)
+
+# when looking at the lungs 9.54% of genes are differentially expressed
+lung_gene_table <- results(dds, contrast=c("Group", "Lung_WT_Case", "Lung_WT_Control"))
+lung_genes_df <- find_diff_expressed (lung_gene_table)
+
+# when looking at thestat# when looking at the blood 21.24% of genes are differentially expressed
+blood_gene_table <- results(dds, contrast=c("Group", "Blood_WT_Case", "Blood_WT_Control"))
+blood_genes_df <- find_diff_expressed (blood_gene_table)
+
+
+
+# visualization of differntially expressed genes with volcano plot  
+
+# volcano plot for lung 
+lung_volcano_plot <- ggplot(data=lung_genes_df, aes(x=log2FoldChange, y=-log10(padj))) + 
+    geom_point(aes(colour = (log2FoldChange > 2 | log2FoldChange < -2) & -log10(padj) > -log10(0.05))) + 
+    theme_minimal() + theme(plot.title = element_text(hjust = 0.5)) +
+    labs( title = "Lung Tissue",
+          x = "Log2 Fold Change", 
+          y = "-Log10 Adjusted P-value",
+          color = "Significance Level") +
+    geom_vline(xintercept=c(-2, 2), col="red") +
+    geom_hline(yintercept=-log10(0.05), col="red") +
+    scale_colour_manual(values = c("FALSE" = "grey", "TRUE" = "skyblue"),
+                        labels = c("FALSE" = "Non-Significant", "TRUE" = "Significant")) +
+    theme(plot.title = element_text(size = 16), 
+          axis.title = element_text(size = 14),  
+          axis.text = element_text(size = 12), 
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 12) )
+
+
+# volcano plot for blood 
+blood_volcano_plot <- ggplot(data=blood_genes_df, aes(x=log2FoldChange, y=-log10(padj))) + 
+    geom_point(aes(colour = (log2FoldChange > 2 | log2FoldChange < -2) & -log10(padj) > -log10(0.05))) + 
+    theme_minimal() + theme(plot.title = element_text(hjust = 0.5)) +
+    labs( title = "Blood Tissue",
+          x = "Log2 Fold Change", 
+          y = "-Log10 Adjusted P-value",
+          color = "Significance") +
+    geom_vline(xintercept=c(-2, 2), col="red") +
+    geom_hline(yintercept=-log10(0.05), col="red") +
+    scale_colour_manual(values = c("FALSE" = "grey", "TRUE" = "salmon"),
+                        labels = c("FALSE" = "Non-Significant", "TRUE" = "Significant")) +
+    theme(plot.title = element_text(size = 16), 
+          axis.title = element_text(size = 14),  
+          axis.text = element_text(size = 12), 
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 12) )
+
+# set to print volcano plotscorrectly 
+combined_volcano_plots <- grid.arrange(lung_volcano_plot, blood_volcano_plot, ncol = 2)
+ggsave(filename = "combined_volcano_plots.png", plot = combined_volcano_plots, width = 11, height = 4, dpi = 300)
+
+
+
+# Explore top upregulated and donwregulated genes
+
+# Function to add symbols and description for ensembl genes
+add_gene_descriptions <- function (dataframe) {
+    
+    ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+    common_names <- getBM(
+        attributes = c("ensembl_gene_id", "mgi_symbol", "description"),
+        values = rownames(dataframe), mart = ensembl)
+    
+    merged_df <- merge(dataframe, common_names, 
+                       by.x = "row.names", by.y = "ensembl_gene_id", 
+                       all.x = TRUE)
+    
+    return (merged_df)
+}
+
+## Top upregulated and downregulated genes in the blood 
+blood_diff_expressed <- subset(blood_genes_df, padj < 0.05 & !is.na(padj) & ( log2FoldChange > 2 | log2FoldChange < -2))
+blood_diff_expressed_with_descriptions <- add_gene_descriptions(blood_diff_expressed)
+blood_diff_expressed_with_descriptions <- blood_diff_expressed_with_descriptions[order(-blood_diff_expressed_with_descriptions$log2FoldChange, 
+                                                                                       -blood_diff_expressed_with_descriptions$padj), ]
+head(blood_diff_expressed_with_descriptions, n = 10) # top 10 upregulated genes 
+tail(blood_diff_expressed_with_descriptions, n = 10) # top 10 downregulated genes 
+
+## Top upregulated and downregulated genes in the lung 
+lung_diff_expressed <- subset(lung_genes_df, padj < 0.05 & !is.na(padj) & ( log2FoldChange > 2 | log2FoldChange < -2))
+lung_diff_expressed_with_descriptions <- add_gene_descriptions(lung_diff_expressed)
+lung_diff_expressed_with_descriptions <- lung_diff_expressed_with_descriptions[order(lung_diff_expressed_with_descriptions$log2FoldChange, 
+                                                                                     -lung_diff_expressed_with_descriptions$padj), ]
+head(lung_diff_expressed_with_descriptions, n = 10) # top 10 upregulated genes 
+tail(lung_diff_expressed_with_descriptions, n = 10) # top 10 downregulated genes 
+
+## Top upregulated and downregulated genes common to both blood and lung tissues
+common_genes_list <- intersect(lung_diff_expressed_with_descriptions$Row.names, blood_diff_expressed_with_descriptions$Row.names)
+common_genes_df <- lung_diff_expressed_with_descriptions[lung_diff_expressed_with_descriptions$Row.names %in% common_genes_list,]
+common_genes_df <- common_genes_df[order(common_genes_df$log2FoldChange, -common_genes_df$padj), ]
+
+head(common_genes_df, n = 10) # top 10 upregulated genes 
+tail(common_genes_df, n = 10) # top 10 downregulated genes 
+
+
+
+# Gene Ontology Overepresentation Analysis of both the lung and blood differentialy expressed genes
+
+# GO enrichment analysis wrapper function for genes with more than 2 
+#   or less than -2 fold change and significant adjusted P-value 
+apply_enrichGO_all_fold_change <- function(gene_dataframe, chosen_ont) { # Ontology: "BP", "MF", or "CC"
+    diff_expressed <- subset(gene_dataframe, 
+                             padj < 0.05 
+                             & (log2FoldChange < -2 | log2FoldChange > 2) )
+    
+    eGO <- enrichGO(gene  = rownames(diff_expressed) ,
+                    universe = rownames(gene_dataframe),
+                    OrgDb = org.Mm.eg.db,
+                    keyType       = "ENSEMBL", 
+                    ont           = chosen_ont,       
+                    pAdjustMethod = "BH",       # Adjust p-values using Benjamini-Hochberg method 
+                    pvalueCutoff  = 0.05, 
+                    qvalueCutoff  = 0.05)       # with qvalue cutoff specified below
+    
+    # simplify Go terms to slim go terms to reduce redundant terms
+    simplified_eGO <- simplify(eGO) 
+    
+    return (simplified_eGO)
+}
+
+# GOEA visualizations for each ontology
+print_three_dotplots <- function (eGO_BP, eGO_MF, eGO_CC, Title) {
+    BP_dotplot <- dotplot(eGO_BP) + ggtitle("3.2.1 Biological Process")
+    MF_dotplot <- dotplot(eGO_MF) + ggtitle("3.2.2 Molecular Function")
+    CC_dotplot <- dotplot(eGO_CC) + ggtitle("3.2.3 Cellular Component")
+    
+    combined_dotplots <- grid.arrange(BP_dotplot, 
+                                      MF_dotplot, 
+                                      CC_dotplot,
+                                      ncol = 3,
+                                      top = textGrob(Title, gp = gpar(fontsize = 16, fontface = "bold"))
+    )
+    return (combined_dotplots)
+}
+
+# Blood GOEA visualizations for each ontology
+
+all_diff_expressed_blood_eGO_BP <- apply_enrichGO_all_fold_change(blood_genes_df, "BP")
+all_diff_expressed_blood_eGO_MF <- apply_enrichGO_all_fold_change(blood_genes_df, "MF")
+all_diff_expressed_blood_eGO_CC <- apply_enrichGO_all_fold_change(blood_genes_df, "CC")
+
+Blood_dotplots <- print_three_dotplots(all_diff_expressed_blood_eGO_BP, 
+                                       all_diff_expressed_blood_eGO_MF, 
+                                       all_diff_expressed_blood_eGO_CC,
+                                       "3.2 Blood Gene Ontology Enrichment Anlysis")
+
+ggsave(filename = "Blood_dotplots.png", plot = Blood_dotplots, width = 16, height = 4, dpi = 300)
+
+
+# Lung GOEA visualizations for each ontology
+
+all_diff_expressed_lung_eGO_BP <- apply_enrichGO_all_fold_change(lung_genes_df,"BP")
+all_diff_expressed_lung_eGO_MF <- apply_enrichGO_all_fold_change(lung_genes_df,"MF")
+all_diff_expressed_lung_eGO_CC <- apply_enrichGO_all_fold_change(lung_genes_df,"CC")
+
+Lung_dotplots <- print_three_dotplots(all_diff_expressed_lung_eGO_BP,
+                                      all_diff_expressed_lung_eGO_MF,
+                                      all_diff_expressed_lung_eGO_CC,
+                                      "3.1 Lung Gene Ontology Enrichment Anlysis")
+
+ggsave(filename = "Lung_dotplots.png", plot = Lung_dotplots, width = 16, height = 4, dpi = 300)
+
+
+
+# Investigation specefific genes : Il12a Il12rb2 with a boxplot
+
+vsd # Variance Stabilizing Transformation object from PCA
+expr_data <- as.data.frame(assay(vsd))  # Extract transformed expression matrix and convert to dataframe format
+
+expr_data$Gene <- rownames(expr_data)  # Add gene names as a column
+expr_long <- melt(expr_data, id.vars = "Gene", variable.name = "Sample", value.name = "Expression")
+expr_long <- merge(expr_long, metadata) # add metadata columns
+
+
+gene_boxplotter <- function (target_gene, gene_name = target_gene, legend_position = "none", gene_dataframe = expr_long) {
+    target_gene_subset <- gene_dataframe[gene_dataframe$Gene == target_gene,]
+    
+    ggplot(target_gene_subset, aes(x = Group, y = Expression, fill = Group)) +
+        geom_boxplot() +
+        geom_point() +
+        scale_fill_manual(values = c("red3", "salmon", "skyblue4", "lightblue")) +  # Customize colors
+        theme_minimal() +
+        labs(title = gene_name, x = "Sample", y = "Expression Level") +
+        theme(legend.position = legend_position,
+              plot.title = element_text(size = 16, hjust = 0.5, vjust = 0.6), 
+              axis.title = element_text(size = 14),  
+              axis.text = element_text(size = 12), 
+              legend.title = element_text(size = 14), 
+              legend.text = element_text(size = 12) )
+}
+#   Il12a ENSMUSG00000027776
+(Il12a_boxplot <- gene_boxplotter("ENSMUSG00000027776", "IL-12a"))
+ggsave(filename = "Il12a_boxplot.png", plot = Il12a_boxplot, width = 7, height = 5, dpi = 300)
+
+#   Il12rb2 ENSMUSG00000018341
+Il12rb2_boxplot <- gene_boxplotter("ENSMUSG00000018341", "Il-12rb2", "right")
+ggsave(filename = "Il12rb2_boxplot.png", plot = Il12rb2_boxplot, width = 8, height = 5, dpi = 300)
+
+Il12a_Il12rb2_boxplots <- grid.arrange(Il12a_boxplot, Il12rb2_boxplot, ncol = 2)
+ggsave(filename = "Il12a_Il12rb2_boxplots.png", plot = Il12a_Il12rb2_boxplots, width = 17, height = 5, dpi = 300)
+
+
+
+
+
+
+
+
+
+
